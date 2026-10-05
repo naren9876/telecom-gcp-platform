@@ -1,0 +1,231 @@
+# variables/global.tfvars.yaml
+# Global variables used across all environments
+# These are merged with environment-specific variables
+
+# GCP Configuration
+organization_id: "621414283807" 
+billing_account_name: "My Billing Account" 
+billing_account_id: "01B7C7-9B363E-DF23BD"
+# GCP Projects - for terraform/projects/ layer
+environments:
+  dev:
+    project_id: "telecom-dev-123"
+    project_name: "Telecom Platform - Development"
+  staging:
+    project_id: "telecom-staging-456"
+    project_name: "Telecom Platform - Staging"
+  production:
+    project_id: "telecom-prod-789"
+    project_name: "Telecom Platform - Production"
+
+required_apis:
+  - cloudresourcemanager.googleapis.com
+  - compute.googleapis.com
+  - container.googleapis.com
+  - run.googleapis.com
+  - spanner.googleapis.com
+  - firestore.googleapis.com
+  - bigtable.googleapis.com
+  - bigquery.googleapis.com
+  - pubsub.googleapis.com
+  - secretmanager.googleapis.com
+  - cloudkms.googleapis.com
+  - logging.googleapis.com
+  - monitoring.googleapis.com
+  - cloudtrace.googleapis.com
+
+terraform_roles:
+  - roles/editor
+  - roles/iam.securityAdmin
+  - roles/resourcemanager.projectIamAdmin
+  - roles/servicemanagement.admin
+  - roles/cloudkms.admin
+  - roles/storage.admin
+  - roles/artifactregistry.admin
+
+common_labels:
+  managed_by: "terraform"
+  team: "platform"
+  component: "infrastructure"
+gcp_region: "us-central1"
+gcp_zone: "us-central1-a"
+
+# Naming conventions
+project_name: "telecom"
+naming_convention: "${project_name}-${component}-${environment}"
+
+# Networking
+cidr_blocks:
+  services_subnet: "10.0.0.0/24"
+  databases_subnet: "10.1.0.0/24"
+  monitoring_subnet: "10.2.0.0/24"
+
+# Database Configuration (Global Defaults)
+spanner_config:
+  display_name: "Telecom Spanner Instance"
+  database_name: "telecom_transactional"
+  ddl_statements:
+    - |
+      CREATE TABLE users (
+        id STRING(64) NOT NULL,
+        email STRING(255) NOT NULL,
+        phone_number STRING(20),
+        full_name STRING(255),
+        subscription_tier STRING(50),
+        status STRING(50),
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP,
+        CONSTRAINT uc_email UNIQUE(email),
+      ) PRIMARY KEY(id)
+    - |
+      CREATE TABLE accounts (
+        id STRING(64) NOT NULL,
+        user_id STRING(64) NOT NULL,
+        balance NUMERIC,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP,
+        CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id)
+      ) PRIMARY KEY(id)
+
+firestore_config:
+  location_id: "us-central1"
+  database_name: "(default)"
+  type: "FIRESTORE_NATIVE"
+
+bigtable_config:
+  display_name: "Telecom BigTable Instance"
+  column_families:
+    usage_data:
+      gc_rule: "maxAge: 8766h"  # 1 year
+    rate_limit:
+      gc_rule: "maxAge: 720h"   # 30 days
+
+# Pub/Sub Topics Configuration
+pubsub_topics:
+  - name: "user-events"
+    retention_days: 7
+    message_retention_duration: "604800s"  # 7 days
+  - name: "usage-events"
+    retention_days: 7
+    message_retention_duration: "604800s"
+  - name: "billing-events"
+    retention_days: 30
+    message_retention_duration: "2592000s"  # 30 days
+  - name: "notification-jobs"
+    retention_days: 7
+    message_retention_duration: "604800s"
+
+# Cloud Run Services Configuration
+services:
+  user-service:
+    name: "user-service"
+    image: "gcr.io/${gcp_project_id}/user-service:latest"
+    container_port: 8080
+    health_check_path: "/health"
+    cpu_request: "100m"
+    memory_request: "128Mi"
+    timeout_seconds: 300
+    secret_env_vars:
+      - name: "DB_PASSWORD"
+        secret: "db-password"
+      - name: "JWT_KEY"
+        secret: "jwt-signing-key"
+
+  billing-service:
+    name: "billing-service"
+    image: "gcr.io/${gcp_project_id}/billing-service:latest"
+    container_port: 8080
+    health_check_path: "/health"
+    cpu_request: "200m"
+    memory_request: "256Mi"
+    timeout_seconds: 300
+    secret_env_vars:
+      - name: "DB_PASSWORD"
+        secret: "db-password"
+      - name: "BILLING_KEY"
+        secret: "billing-provider-key"
+
+  usage-service:
+    name: "usage-service"
+    image: "gcr.io/${gcp_project_id}/usage-service:latest"
+    container_port: 8080
+    health_check_path: "/health"
+    cpu_request: "500m"
+    memory_request: "512Mi"
+    timeout_seconds: 60
+    secret_env_vars:
+      - name: "DB_PASSWORD"
+        secret: "db-password"
+
+  notification-service:
+    name: "notification-service"
+    image: "gcr.io/${gcp_project_id}/notification-service:latest"
+    container_port: 8080
+    health_check_path: "/health"
+    cpu_request: "200m"
+    memory_request: "256Mi"
+    timeout_seconds: 300
+    secret_env_vars:
+      - name: "NOTIFICATION_API_KEY"
+        secret: "notification-api-key"
+
+  analytics-service:
+    name: "analytics-service"
+    image: "gcr.io/${gcp_project_id}/analytics-service:latest"
+    container_port: 8080
+    health_check_path: "/health"
+    cpu_request: "100m"
+    memory_request: "128Mi"
+    timeout_seconds: 600
+    secret_env_vars: []
+
+# Monitoring Configuration
+monitoring:
+  log_levels:
+    ERROR: 30
+    WARN: 14
+    INFO: 7
+    DEBUG: 1
+
+  slos:
+    - name: "user-service-availability"
+      target: 0.9995
+      window_days: 30
+    - name: "billing-service-availability"
+      target: 0.9999
+      window_days: 30
+    - name: "usage-service-latency"
+      target_percentile: 0.99
+      target_ms: 100
+
+# API Gateway Configuration
+api:
+  domains:
+    dev: ["api.dev.telecom-app.com"]
+    staging: ["api.staging.telecom-app.com"]
+    production: ["api.telecom-app.com"]
+
+  ssl_policy: "MODERN"
+  min_tls_version: "TLS_1_2"
+
+# Cost Management
+budget:
+  monthly_limit: 5000  # USD
+  alert_threshold: 0.9
+
+# Compliance & Security
+compliance:
+  enable_cmek: true
+  require_audit_logs: true
+  enable_vpc_service_controls: false
+  pii_columns:
+    - "email"
+    - "phone_number"
+    - "full_name"
+
+# Tags/Labels applied to all resources
+tags:
+  project: "telecom-platform"
+  managed_by: "terraform"
+  cost_center: "engineering"
+  owner_team: "platform-engineering"

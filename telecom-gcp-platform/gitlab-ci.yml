@@ -1,0 +1,488 @@
+stages:
+  - validate
+  - build
+  - security-scan
+  - test
+  - deploy-staging
+  - integration-test
+  - deploy-production
+
+variables:
+  GCP_PROJECT_ID_DEV: "telecom-app-dev"
+  GCP_PROJECT_ID_STAGING: "telecom-app-staging"
+  GCP_PROJECT_ID_PRODUCTION: "telecom-app-production"
+  GCP_REGION: "us-central1"
+  REGISTRY: "gcr.io"
+  DOCKER_DRIVER: "overlay2"
+  DOCKER_TLS_CERTDIR: "/certs"
+  TERRAFORM_VERSION: "1.5.0"
+
+# Workflow rules for branch/tag conditions
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+
+default:
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+# ============================================
+# VALIDATE STAGE
+# ============================================
+
+terraform-validate:
+  stage: validate
+  image: hashicorp/terraform:${TERRAFORM_VERSION}
+  script:
+    - cd infrastructure/terraform
+    - terraform init -backend=false -input=false
+    - terraform validate
+    - terraform fmt -check -recursive .
+  only:
+    - merge_requests
+  allow_failure: false
+  artifacts:
+    reports:
+      terraform: infrastructure/terraform/plan.json
+
+lint-services:
+  stage: validate
+  image: golang:1.21-alpine
+  script:
+    - cd services
+    - go mod download
+    - go vet ./...
+    - go fmt ./... && git diff --exit-code
+  only:
+    - merge_requests
+  allow_failure: true
+
+docker-lint:
+  stage: validate
+  image: hadolint/hadolint:v2.12.0-alpine
+  script:
+    - find services -name "Dockerfile" -type f | while read file; do
+        echo "Linting $file";
+        hadolint "$file";
+      done
+  only:
+    - merge_requests
+  allow_failure: true
+
+# ============================================
+# BUILD STAGE
+# ============================================
+
+build-services:
+  stage: build
+  image: google/cloud-sdk:alpine
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_VERIFY: 0
+  before_script:
+    - echo $GCP_SERVICE_ACCOUNT_KEY | base64 -d > /tmp/key.json
+    - gcloud auth activate-service-account --key-file=/tmp/key.json
+    - gcloud config set project $GCP_PROJECT_ID_STAGING
+    - gcloud auth configure-docker ${REGISTRY}
+  script:
+    - |
+      SERVICES=("user-service" "billing-service" "notification-service" "usage-service" "analytics-service")
+      for service in "${SERVICES[@]}"; do
+        SERVICE_IMAGE="${REGISTRY}/${GCP_PROJECT_ID_STAGING}/${service}:${CI_COMMIT_SHA}"
+        SERVICE_LATEST="${REGISTRY}/${GCP_PROJECT_ID_STAGING}/${service}:latest"
+
+        echo "Building ${service}..."
+        docker build \
+          --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+          --build-arg VCS_REF=${CI_COMMIT_SHA} \
+          --build-arg VERSION=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}} \
+          -t ${SERVICE_IMAGE} \
+          -t ${SERVICE_LATEST} \
+          services/${service}
+
+        echo "Pushing ${service} to registry..."
+        docker push ${SERVICE_IMAGE}
+        docker push ${SERVICE_LATEST}
+      done
+  after_script:
+    - rm -f /tmp/key.json
+  only:
+    - main
+    - tags
+  cache:
+    paths:
+      - .docker_cache/
+
+# ============================================
+# SECURITY SCAN STAGE
+# ============================================
+
+trivy-image-scan:
+  stage: security-scan
+  image: aquasec/trivy:latest
+  before_script:
+    - echo $GCP_SERVICE_ACCOUNT_KEY | base64 -d > /tmp/key.json
+    - gcloud auth activate-service-account --key-file=/tmp/key.json
+    - gcloud config set project $GCP_PROJECT_ID_STAGING
+    - gcloud auth configure-docker ${REGISTRY}
+  script:
+    - |
+      SERVICES=("user-service" "billing-service" "notification-service" "usage-service" "analytics-service")
+      for service in "${SERVICES[@]}"; do
+        SERVICE_IMAGE="${REGISTRY}/${GCP_PROJECT_ID_STAGING}/${service}:${CI_COMMIT_SHA}"
+
+        echo "Scanning ${service} with Trivy..."
+        trivy image --severity CRITICAL,HIGH --exit-code 1 \
+          --format sarif --output ${service}-trivy.sarif \
+          ${SERVICE_IMAGE} || true
+      done
+  after_script:
+    - rm -f /tmp/key.json
+  artifacts:
+    reports:
+      container_scanning: "*.sarif"
+    expire_in: 30 days
+  only:
+    - main
+    - tags
+  allow_failure: true
+
+sast-analysis:
+  stage: security-scan
+  image: returntocorp/semgrep
+  script:
+    - semgrep --config=p/security-audit --config=p/owasp-top-ten --json \
+        --output=sast-report.json services/ || true
+  artifacts:
+    reports:
+      sast: sast-report.json
+    expire_in: 30 days
+  only:
+    - merge_requests
+  allow_failure: true
+
+secret-scan:
+  stage: security-scan
+  image: zricethezav/gitleaks:latest
+  script:
+    - gitleaks detect --source . --report-path gitleaks-report.json || true
+  artifacts:
+    reports:
+      secret_detection: gitleaks-report.json
+    expire_in: 30 days
+  only:
+    - merge_requests
+  allow_failure: true
+
+# ============================================
+# TEST STAGE
+# ============================================
+
+unit-tests:
+  stage: test
+  image: golang:1.21
+  script:
+    - cd services
+    - go mod download
+    - go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+    - go tool cover -func=coverage.out -o coverage-summary.txt
+    - cat coverage-summary.txt
+  coverage: '/^total:\s+\(statements\)\s+(\d+\.?\d*)%/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - coverage-summary.txt
+    expire_in: 30 days
+  only:
+    - merge_requests
+  retry:
+    max: 2
+
+integration-tests-staging:
+  stage: integration-test
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo $GCP_SERVICE_ACCOUNT_KEY | base64 -d > /tmp/key.json
+    - gcloud auth activate-service-account --key-file=/tmp/key.json
+    - gcloud config set project ${GCP_PROJECT_ID_STAGING}
+    - gcloud config set compute/region ${GCP_REGION}
+    - apk add --no-cache curl jq
+  script:
+    - |
+      echo "Waiting for services to be ready..."
+      for i in {1..60}; do
+        if curl -f -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+          "https://user-service-${CI_COMMIT_SHORT_SHA}.run.app/health" > /dev/null 2>&1; then
+          echo "Services are ready"
+          break
+        fi
+        echo "Waiting... ($i/60)"
+        sleep 5
+      done
+
+      echo "Running integration tests..."
+      cd tests/integration
+
+      # Run comprehensive test suite
+      ./run-integration-tests.sh \
+        --host="https://api.staging.telecom-app.com" \
+        --auth-token="$(gcloud auth print-identity-token)" \
+        --verbose
+  after_script:
+    - rm -f /tmp/key.json
+  environment:
+    name: staging
+    action: prepare
+  artifacts:
+    paths:
+      - tests/integration/test-results/
+    reports:
+      junit: tests/integration/test-results/junit.xml
+    expire_in: 30 days
+  retry:
+    max: 2
+  only:
+    - main
+
+# ============================================
+# DEPLOY STAGING
+# ============================================
+
+deploy-staging:
+  stage: deploy-staging
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo $GCP_SERVICE_ACCOUNT_KEY | base64 -d > /tmp/key.json
+    - gcloud auth activate-service-account --key-file=/tmp/key.json
+    - gcloud config set project ${GCP_PROJECT_ID_STAGING}
+    - gcloud config set compute/region ${GCP_REGION}
+    - curl -fsSL https://apt.releases.hashicorp.com/gpg | apt-key add - 2>/dev/null || true
+    - apt-get update && apt-get install -y terraform=1.5.0
+  script:
+    - echo "Deploying infrastructure to staging..."
+    - cd infrastructure/terraform/environments/staging
+
+    # Terraform deployment
+    - terraform init \
+        -backend-config="bucket=telecom-app-terraform-state-staging" \
+        -backend-config="encryption_key=${TF_STATE_ENCRYPTION_KEY}"
+    - terraform plan -out=tfplan -var-file=staging.tfvars
+    - terraform apply -auto-approve tfplan
+
+    # Deploy Cloud Run services
+    - cd ../../../
+    - |
+      SERVICES=("user-service" "billing-service" "notification-service" "usage-service" "analytics-service")
+      for service in "${SERVICES[@]}"; do
+        SERVICE_IMAGE="${REGISTRY}/${GCP_PROJECT_ID_STAGING}/${service}:${CI_COMMIT_SHA}"
+
+        echo "Deploying ${service} to Cloud Run..."
+        gcloud run deploy ${service} \
+          --image ${SERVICE_IMAGE} \
+          --region ${GCP_REGION} \
+          --platform managed \
+          --no-allow-unauthenticated \
+          --service-account "${service}-sa@${GCP_PROJECT_ID_STAGING}.iam.gserviceaccount.com" \
+          --set-env-vars "ENVIRONMENT=staging,CI_COMMIT_SHA=${CI_COMMIT_SHA}" \
+          --memory 512Mi \
+          --cpu 1 \
+          --timeout 300 \
+          --max-instances 10 \
+          --min-instances 1 \
+          --no-gen2 \
+          --quiet
+      done
+  after_script:
+    - rm -f /tmp/key.json
+  environment:
+    name: staging
+    url: https://api.staging.telecom-app.com
+    action: prepare
+  artifacts:
+    paths:
+      - infrastructure/terraform/environments/staging/tfplan
+    expire_in: 1 day
+  only:
+    - main
+  dependencies:
+    - build-services
+
+# ============================================
+# DEPLOY PRODUCTION
+# ============================================
+
+deploy-production:
+  stage: deploy-production
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo $GCP_SERVICE_ACCOUNT_KEY_PROD | base64 -d > /tmp/key-prod.json
+    - gcloud auth activate-service-account --key-file=/tmp/key-prod.json
+    - gcloud config set project ${GCP_PROJECT_ID_PRODUCTION}
+    - gcloud config set compute/region ${GCP_REGION}
+    - curl -fsSL https://apt.releases.hashicorp.com/gpg | apt-key add - 2>/dev/null || true
+    - apt-get update && apt-get install -y terraform=1.5.0
+    - apk add --no-cache curl jq
+  script:
+    - echo "Deploying to production with blue-green strategy..."
+    - cd infrastructure/terraform/environments/production
+
+    # Terraform deployment
+    - terraform init \
+        -backend-config="bucket=telecom-app-terraform-state-production" \
+        -backend-config="encryption_key=${TF_STATE_ENCRYPTION_KEY_PROD}"
+    - terraform plan -out=tfplan -var-file=production.tfvars
+    - terraform apply -auto-approve tfplan
+
+    # Blue-green deployment with traffic shifting
+    - cd ../../../
+    - |
+      SERVICES=("user-service" "billing-service" "notification-service" "usage-service" "analytics-service")
+
+      for service in "${SERVICES[@]}"; do
+        SERVICE_IMAGE="${REGISTRY}/${GCP_PROJECT_ID_PRODUCTION}/${service}:${CI_COMMIT_SHA}"
+        CURRENT_REVISION=$(gcloud run services describe ${service} \
+          --region ${GCP_REGION} \
+          --format='value(status.latestRevision)' || echo "")
+
+        echo "Blue-green deployment for ${service}..."
+
+        # Deploy new revision (green)
+        gcloud run deploy ${service} \
+          --image ${SERVICE_IMAGE} \
+          --region ${GCP_REGION} \
+          --platform managed \
+          --no-allow-unauthenticated \
+          --service-account "${service}-sa@${GCP_PROJECT_ID_PRODUCTION}.iam.gserviceaccount.com" \
+          --set-env-vars "ENVIRONMENT=production,CI_COMMIT_SHA=${CI_COMMIT_SHA}" \
+          --memory 512Mi \
+          --cpu 1 \
+          --timeout 300 \
+          --max-instances 100 \
+          --min-instances 3 \
+          --no-gen2 \
+          --quiet
+
+        NEW_REVISION=$(gcloud run services describe ${service} \
+          --region ${GCP_REGION} \
+          --format='value(status.latestRevision)')
+
+        if [ -z "$CURRENT_REVISION" ]; then
+          echo "First deployment, routing 100% to new revision"
+          gcloud run services update-traffic ${service} \
+            --to-revisions LATEST=100 \
+            --region ${GCP_REGION} \
+            --quiet
+        else
+          echo "Gradual traffic shift: 0% -> 10% -> 50% -> 100%"
+
+          # 10% traffic to new revision
+          gcloud run services update-traffic ${service} \
+            --to-revisions ${CURRENT_REVISION}=90,${NEW_REVISION}=10 \
+            --region ${GCP_REGION} \
+            --quiet
+          echo "Shifted 10% traffic to new revision. Monitoring for 5 minutes..."
+          sleep 300
+
+          # Check error rate
+          ERROR_RATE=$(gcloud monitoring time-series list \
+            --filter="resource.type=cloud_run_revision AND resource.labels.service_name=${service} AND metric.type=run.googleapis.com/request_count" \
+            --format=json | jq '.[0].points[0].value.double_value' 2>/dev/null || echo "0")
+
+          if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+            echo "Error rate too high, rolling back..."
+            gcloud run services update-traffic ${service} \
+              --to-revisions ${CURRENT_REVISION}=100 \
+              --region ${GCP_REGION} \
+              --quiet
+            exit 1
+          fi
+
+          # 50% traffic to new revision
+          gcloud run services update-traffic ${service} \
+            --to-revisions ${CURRENT_REVISION}=50,${NEW_REVISION}=50 \
+            --region ${GCP_REGION} \
+            --quiet
+          echo "Shifted 50% traffic to new revision. Monitoring for 5 minutes..."
+          sleep 300
+
+          # 100% traffic to new revision
+          gcloud run services update-traffic ${service} \
+            --to-revisions ${NEW_REVISION}=100 \
+            --region ${GCP_REGION} \
+            --quiet
+          echo "Completed traffic shift to new revision"
+        fi
+      done
+  after_script:
+    - rm -f /tmp/key-prod.json
+  environment:
+    name: production
+    url: https://api.telecom-app.com
+    action: prepare
+    kubernetes:
+      namespace: production
+  artifacts:
+    paths:
+      - infrastructure/terraform/environments/production/tfplan
+    expire_in: 1 day
+  when: manual
+  only:
+    - tags
+  dependencies:
+    - build-services
+
+# ============================================
+# ROLLBACK PRODUCTION (Manual)
+# ============================================
+
+rollback-production:
+  stage: deploy-production
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo $GCP_SERVICE_ACCOUNT_KEY_PROD | base64 -d > /tmp/key-prod.json
+    - gcloud auth activate-service-account --key-file=/tmp/key-prod.json
+    - gcloud config set project ${GCP_PROJECT_ID_PRODUCTION}
+    - gcloud config set compute/region ${GCP_REGION}
+  script:
+    - echo "Rolling back to previous deployment..."
+    - |
+      SERVICES=("user-service" "billing-service" "notification-service" "usage-service" "analytics-service")
+      for service in "${SERVICES[@]}"; do
+        echo "Rolling back ${service}..."
+
+        # Get previous revision
+        REVISIONS=$(gcloud run revisions list --service=${service} --region=${GCP_REGION} \
+          --format='value(REVISION)' --limit=2)
+        PREVIOUS_REVISION=$(echo $REVISIONS | awk '{print $2}')
+
+        if [ -z "$PREVIOUS_REVISION" ]; then
+          echo "No previous revision found for ${service}"
+          continue
+        fi
+
+        # Route all traffic to previous revision
+        gcloud run services update-traffic ${service} \
+          --to-revisions ${PREVIOUS_REVISION}=100 \
+          --region ${GCP_REGION} \
+          --quiet
+
+        echo "Successfully rolled back ${service} to ${PREVIOUS_REVISION}"
+      done
+  after_script:
+    - rm -f /tmp/key-prod.json
+  when: manual
+  only:
+    - tags
+  environment:
+    name: production
+    action: rollback

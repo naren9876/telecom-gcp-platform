@@ -1,0 +1,130 @@
+# .pre-commit-config.yaml
+# Pre-commit hooks for Terraform code quality and security
+# Install: pip install pre-commit
+# Setup: pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # Terraform formatting and validation
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.88.0
+    hooks:
+      # Format Terraform files
+      - id: terraform_fmt
+        name: "Terraform Format"
+        description: "Format Terraform files"
+        entry: terraform fmt -recursive
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      # Validate Terraform syntax
+      - id: terraform_validate
+        name: "Terraform Validate"
+        description: "Validate Terraform configuration"
+        entry: terraform validate -no-color
+        language: system
+        files: '\.tf$'
+        exclude: '^\.terraform/'
+
+      # Security scanning with tfsec
+      - id: terraform_tfsec
+        name: "TFSec Security Scan"
+        description: "Scan Terraform files for security issues"
+        entry: tfsec
+        language: system
+        types:
+          - terraform
+        exclude: '^\.terraform/'
+
+      # Documentation generation with terraform-docs
+      - id: terraform_docs
+        name: "Terraform Docs"
+        description: "Generate Terraform documentation"
+        entry: terraform-docs
+        language: system
+        types:
+          - terraform
+        files: 'modules/.*\.tf$'
+
+  # General code quality
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      # Check YAML syntax
+      - id: check-yaml
+        name: "Check YAML"
+        description: "Check YAML file validity"
+        args:
+          - '--unsafe'
+
+      # Check JSON syntax
+      - id: check-json
+        name: "Check JSON"
+        description: "Check JSON file validity"
+
+      # Check for merge conflicts
+      - id: check-merge-conflict
+        name: "Check for merge conflicts"
+        description: "Check for files that would conflict in a merge"
+
+      # Check for large files
+      - id: check-added-large-files
+        name: "Check for large files"
+        description: "Prevent giant files from being committed"
+        args:
+          - '--maxkb=1000'
+
+      # Fix end of file newline
+      - id: end-of-file-fixer
+        name: "Fix End of File"
+        description: "Ensure files end with a newline"
+        exclude: '\.tf$'
+
+      # Trim trailing whitespace
+      - id: trailing-whitespace
+        name: "Trim Trailing Whitespace"
+        description: "Trim trailing whitespace"
+
+  # Secret scanning with Gitleaks
+  - repo: https://github.com/gitleaks/gitleaks-action
+    rev: v2.3.4
+    hooks:
+      - id: gitleaks
+        name: "Gitleaks"
+        description: "Scan for secrets"
+        entry: gitleaks detect --source .
+        language: system
+        pass_filenames: false
+        always_run: true
+
+  # Linting shell scripts
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.9.0.5
+    hooks:
+      - id: shellcheck
+        name: "ShellCheck"
+        description: "Check shell script syntax"
+        types:
+          - shell
+        args:
+          - '--severity=warning'
+
+  # YAML linting
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.33.0
+    hooks:
+      - id: yamllint
+        name: "Yamllint"
+        description: "Lint YAML files"
+        types:
+          - yaml
+
+# Configuration for specific hooks
+exclude: |
+  (?x)^(
+    \.terraform/|
+    \.git/|
+    terraform\.tfstate|
+    \.terraform\.lock\.hcl
+  )
